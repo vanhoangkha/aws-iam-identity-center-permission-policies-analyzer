@@ -1,10 +1,5 @@
 # AWS IAM Identity Center Permission Policies Analyzer
 
-[![SAM Build](https://img.shields.io/badge/SAM-Build%20Passing-brightgreen)](https://aws.amazon.com/serverless/sam/)
-[![Python 3.12](https://img.shields.io/badge/Python-3.12-blue)](https://www.python.org/)
-[![License: MIT-0](https://img.shields.io/badge/License-MIT--0-yellow.svg)](https://opensource.org/licenses/MIT-0)
-[![Tests](https://img.shields.io/badge/Tests-21%20Passing-brightgreen)](./src)
-
 Automated monthly analysis of AWS IAM Identity Center users and their permission policies, generating comprehensive CSV reports.
 
 ## 🏗️ Architecture
