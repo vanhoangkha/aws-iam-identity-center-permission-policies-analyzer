@@ -1,38 +1,108 @@
+AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
+Description: AWS IAM Identity Center Permission Policies Analyzer
+
+Metadata:
+  AWS::ServerlessRepo::Application:
+    Name: iam-identity-center-analyzer
+    Description: Analyzes IAM Identity Center users and permission policies
+    Author: AWS
+    SpdxLicenseId: MIT-0
+    ReadmeUrl: README.md
+    Labels: ['iam', 'identity-center', 'sso', 'security', 'compliance']
+
 Parameters:
   EmailAddress:
     Type: String
-    Description: Enter your email address to receive notification
+    Description: Email address for notifications
+    AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address
   IdentityStoreID:
     Type: String
-    Description: Enter your Identity Store ID
+    Description: Identity Store ID (e.g., d-xxxxxxxxxx)
   IdentityStoreInstanceArn:
     Type: String
-    Description: Enter your Identity Store Instance ARN
+    Description: Identity Store Instance ARN
+  ReportRetentionDays:
+    Type: Number
+    Default: 365
+    MinValue: 1
+    MaxValue: 2555
+    Description: Days to retain reports in S3
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Tracing: Active
+    Timeout: 600
+    Architectures:
+      - arm64
+    Environment:
+      Variables:
+        LOG_LEVEL: INFO
+        POWERTOOLS_SERVICE_NAME: identity-center-analyzer
+        POWERTOOLS_METRICS_NAMESPACE: IdentityCenterAnalyzer
+
 Resources:
-  monthlySchedule:
-    Type: AWS::Scheduler::Schedule
+  # KMS Key for encryption
+  EncryptionKey:
+    Type: AWS::KMS::Key
     Properties:
-      GroupName: !Ref monthlyScheduleGroup
-      ScheduleExpression: cron(0 8 1 * ? *)
-      FlexibleTimeWindow:
-        Mode: 'OFF'
-      ScheduleExpressionTimezone: Asia/Singapore
-      Target:
-        Arn: !Ref monthlyUserPermissionAssessment
-        RoleArn: !GetAtt monthlyScheduleTomonthlyUserPermissionAssessmentRole.Arn
-        Input: 
-          !Sub | 
-            {
-              "identityStoreId": "${IdentityStoreID}",
-              "instanceArn": "${IdentityStoreInstanceArn}",
-              "ssoDeployedRegion": "${AWS::Region}" 
-            }
-  monthlyScheduleGroup:
-    Type: AWS::Scheduler::ScheduleGroup
-  fullPermissionSetsWithGroupTable:
+      Description: KMS key for Identity Center Analyzer
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*
+          - Sid: Allow Step Functions for SNS
+            Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:Decrypt
+            Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  EncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${AWS::StackName}-key
+      TargetKeyId: !Ref EncryptionKey
+
+  # DynamoDB Tables
+  PermissionSetsTable:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
+      TableName: !Sub ${AWS::StackName}-permission-sets
       AttributeDefinitions:
         - AttributeName: id
           AttributeType: S
@@ -47,11 +117,23 @@ Resources:
       SSESpecification:
         SSEEnabled: true
         SSEType: KMS
-      StreamSpecification:
-        StreamViewType: NEW_AND_OLD_IMAGES
-  usersWithGroupTable:
+        KMSMasterKeyId: !Ref EncryptionKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      DeletionProtectionEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  UsersTable:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
+      TableName: !Sub ${AWS::StackName}-users
       AttributeDefinitions:
         - AttributeName: userId
           AttributeType: S
@@ -62,128 +144,387 @@ Resources:
       SSESpecification:
         SSEEnabled: true
         SSEType: KMS
-      StreamSpecification:
-        StreamViewType: NEW_AND_OLD_IMAGES
-  notificationEmail:
+        KMSMasterKeyId: !Ref EncryptionKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      DeletionProtectionEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Topic
+  NotificationTopic:
     Type: AWS::SNS::Topic
     Properties:
-      KmsMasterKeyId: alias/aws/sns
-      Subscription:
-        - Endpoint: !Ref EmailAddress
-          Protocol: email
-  dataExtractionFunction:
+      TopicName: !Sub ${AWS::StackName}-notifications
+      KmsMasterKeyId: !Ref EncryptionKey
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref NotificationTopic
+      Protocol: email
+      Endpoint: !Ref EmailAddress
+
+  # S3 Bucket
+  ReportBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-reports-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref EncryptionKey
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: reports/
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldReports
+            Status: Enabled
+            ExpirationInDays: !Ref ReportRetentionDays
+          - Id: CleanupOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+          - Id: AbortIncompleteMultipartUpload
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  ReportBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ReportBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt ReportBucket.Arn
+              - !Sub ${ReportBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+          - Sid: DenyIncorrectEncryptionHeader
+            Effect: Deny
+            Principal: '*'
+            Action: s3:PutObject
+            Resource: !Sub ${ReportBucket.Arn}/*
+            Condition:
+              StringNotEquals:
+                s3:x-amz-server-side-encryption: aws:kms
+
+  # Access Logs Bucket
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-access-logs-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: S3ServerAccessLogsPolicy
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub ${AccessLogsBucket.Arn}/*
+            Condition:
+              ArnLike:
+                aws:SourceArn: !GetAtt ReportBucket.Arn
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt AccessLogsBucket.Arn
+              - !Sub ${AccessLogsBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # Dead Letter Queues
+  ExtractionDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-extraction-dlq
+      KmsMasterKeyId: !Ref EncryptionKey
+      MessageRetentionPeriod: 1209600
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  TransformDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-transform-dlq
+      KmsMasterKeyId: !Ref EncryptionKey
+      MessageRetentionPeriod: 1209600
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Functions
+  DataExtractionFunction:
     Type: AWS::Serverless::Function
     Properties:
-      Description: !Sub
-        - Stack ${AWS::StackName} Function ${ResourceName}
-        - ResourceName: dataExtractionFunction
+      FunctionName: !Sub ${AWS::StackName}-extraction
+      Description: Extracts IAM Identity Center data
       CodeUri: src/dataExtractionFunction
       Handler: handler.handler
-      Runtime: python3.9
-      MemorySize: 6008
-      Timeout: 600
-      Tracing: Active
+      MemorySize: 1024
+      ReservedConcurrentExecutions: 5
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt ExtractionDLQ.Arn
       Environment:
         Variables:
-          PERMISSION_TABLE_NAME: !Ref fullPermissionSetsWithGroupTable
-          PERMISSION_TABLE_ARN: !GetAtt fullPermissionSetsWithGroupTable.Arn
-          USER_TABLE_NAME: !Ref usersWithGroupTable
-          USER_TABLE_ARN: !GetAtt usersWithGroupTable.Arn
+          PERMISSION_TABLE_NAME: !Ref PermissionSetsTable
+          USER_TABLE_NAME: !Ref UsersTable
       Policies:
         - DynamoDBCrudPolicy:
-            TableName: !Ref fullPermissionSetsWithGroupTable
+            TableName: !Ref PermissionSetsTable
         - DynamoDBCrudPolicy:
-            TableName: !Ref usersWithGroupTable
-        - IAMReadOnlyAccess
-        - AWSSSOReadOnly
+            TableName: !Ref UsersTable
+        - KMSDecryptPolicy:
+            KeyId: !Ref EncryptionKey
         - Statement:
-            - Sid: IdentityStoreReadOnlyAccessPolicy
+            - Sid: IAMReadPolicy
+              Effect: Allow
+              Action:
+                - iam:GetPolicy
+                - iam:GetPolicyVersion
+              Resource: '*'
+        - Statement:
+            - Sid: SSOReadPolicy
+              Effect: Allow
+              Action:
+                - sso:DescribePermissionSet
+                - sso:GetInlinePolicyForPermissionSet
+                - sso:GetPermissionsBoundaryForPermissionSet
+                - sso:ListAccountAssignments
+                - sso:ListAccountsForProvisionedPermissionSet
+                - sso:ListCustomerManagedPolicyReferencesInPermissionSet
+                - sso:ListManagedPoliciesInPermissionSet
+                - sso:ListPermissionSets
+              Resource: '*'
+        - Statement:
+            - Sid: IdentityStoreReadPolicy
               Effect: Allow
               Action:
                 - identitystore:DescribeUser
-                - identitystore:IsMemberInGroups
-                - identitystore:ListGroupMemberships
-                - identitystore:DescribeGroupMembership
-                - identitystore:GetGroupMembershipId
-                - identitystore:ListUsers
                 - identitystore:DescribeGroup
+                - identitystore:ListUsers
                 - identitystore:ListGroups
                 - identitystore:ListGroupMembershipsForMember
-                - identitystore:GetGroupId
-                - identitystore:GetUserId
               Resource: '*'
-  dataExtractionFunctionLogGroup:
+      Tags:
+        Environment: !Ref Environment
+
+  DataExtractionLogGroup:
     Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
-      LogGroupName: !Sub /aws/lambda/${dataExtractionFunction}
+      LogGroupName: !Sub /aws/lambda/${DataExtractionFunction}
       RetentionInDays: 90
-  dataTransformLoadFunction:
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  DataTransformFunction:
     Type: AWS::Serverless::Function
     Properties:
-      Description: !Sub
-        - Stack ${AWS::StackName} Function ${ResourceName}
-        - ResourceName: dataTransformLoadFunction
+      FunctionName: !Sub ${AWS::StackName}-transform
+      Description: Transforms data and generates reports
       CodeUri: src/dataTransformLoadFunction
       Handler: handler.handler
-      Runtime: python3.9
-      MemorySize: 3008
-      Timeout: 600
-      Tracing: Active
+      MemorySize: 512
+      ReservedConcurrentExecutions: 5
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt TransformDLQ.Arn
       Environment:
         Variables:
-          TOPIC_NAME: !GetAtt notificationEmail.TopicName
-          TOPIC_ARN: !Ref notificationEmail
-          USER_TABLE_NAME: !Ref usersWithGroupTable
-          USER_TABLE_ARN: !GetAtt usersWithGroupTable.Arn
-          PERMISSION_TABLE_NAME: !Ref fullPermissionSetsWithGroupTable
-          PERMISSION_TABLE_ARN: !GetAtt fullPermissionSetsWithGroupTable.Arn
-          BUCKET_NAME: !Ref monthlyReportBucket
-          BUCKET_ARN: !GetAtt monthlyReportBucket.Arn
+          TOPIC_ARN: !Ref NotificationTopic
+          USER_TABLE_NAME: !Ref UsersTable
+          PERMISSION_TABLE_NAME: !Ref PermissionSetsTable
+          BUCKET_NAME: !Ref ReportBucket
       Policies:
         - SNSPublishMessagePolicy:
-            TopicName: !GetAtt notificationEmail.TopicName
-        - DynamoDBCrudPolicy:
-            TableName: !Ref usersWithGroupTable
-        - DynamoDBCrudPolicy:
-            TableName: !Ref fullPermissionSetsWithGroupTable
-        - S3CrudPolicy:
-            BucketName: !Ref monthlyReportBucket
-  dataTransformLoadFunctionLogGroup:
+            TopicName: !GetAtt NotificationTopic.TopicName
+        - DynamoDBReadPolicy:
+            TableName: !Ref UsersTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref PermissionSetsTable
+        - S3WritePolicy:
+            BucketName: !Ref ReportBucket
+        - KMSDecryptPolicy:
+            KeyId: !Ref EncryptionKey
+        - Statement:
+            - Sid: KMSEncryptForS3
+              Effect: Allow
+              Action:
+                - kms:GenerateDataKey
+              Resource: !GetAtt EncryptionKey.Arn
+      Tags:
+        Environment: !Ref Environment
+
+  DataTransformLogGroup:
     Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
-      LogGroupName: !Sub /aws/lambda/${dataTransformLoadFunction}
+      LogGroupName: !Sub /aws/lambda/${DataTransformFunction}
       RetentionInDays: 90
-  monthlyUserPermissionAssessment:
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Step Functions
+  AnalyzerStateMachine:
     Type: AWS::Serverless::StateMachine
     Properties:
-      Definition:
-        StartAt: Start
-        States:
-          Start:
-            Type: Task
-            Resource: arn:aws:states:::lambda:invoke
-            Next: AssessmentTask
-            Parameters:
-              FunctionName: ${dataExtractionFunctionArn}
-              Payload.$: $
-          AssessmentTask:
-            Type: Task
-            Next: Done
-            Resource: arn:aws:states:::lambda:invoke
-            Parameters:
-              FunctionName: ${dataTransformLoadFunctionArn}
-              Payload.$: $
-          Done:
-            Type: Pass
-            End: true
+      Name: !Sub ${AWS::StackName}-workflow
+      Type: STANDARD
+      Tracing:
+        Enabled: true
       Logging:
         Level: ALL
         IncludeExecutionData: true
         Destinations:
           - CloudWatchLogsLogGroup:
-              LogGroupArn: !GetAtt monthlyUserPermissionAssessmentLogGroup.Arn
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+      Definition:
+        StartAt: ExtractData
+        States:
+          ExtractData:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: !GetAtt DataExtractionFunction.Arn
+              Payload.$: $
+            ResultPath: $.extractionResult
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.TooManyRequestsException
+                  - Lambda.AWSLambdaException
+                  - States.Timeout
+                IntervalSeconds: 2
+                MaxAttempts: 3
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                ResultPath: $.error
+                Next: NotifyFailure
+            Next: TransformData
+          TransformData:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: !GetAtt DataTransformFunction.Arn
+              Payload.$: $
+            ResultPath: $.transformResult
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.TooManyRequestsException
+                  - Lambda.AWSLambdaException
+                  - States.Timeout
+                IntervalSeconds: 2
+                MaxAttempts: 3
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                ResultPath: $.error
+                Next: NotifyFailure
+            Next: Success
+          NotifyFailure:
+            Type: Task
+            Resource: arn:aws:states:::sns:publish
+            Parameters:
+              TopicArn: !Ref NotificationTopic
+              Subject: "IAM Identity Center Analyzer - FAILED"
+              Message.$: "States.Format('Execution failed: {}', $.error)"
+            Next: Fail
+          Fail:
+            Type: Fail
+            Error: ExecutionFailed
+            Cause: Workflow execution failed
+          Success:
+            Type: Succeed
       Policies:
-        - AWSXrayWriteOnlyAccess
+        - LambdaInvokePolicy:
+            FunctionName: !Ref DataExtractionFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref DataTransformFunction
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt NotificationTopic.TopicName
+        - KMSDecryptPolicy:
+            KeyId: !Ref EncryptionKey
+        - Statement:
+            - Sid: KMSGenerateDataKey
+              Effect: Allow
+              Action:
+                - kms:GenerateDataKey*
+              Resource: !GetAtt EncryptionKey.Arn
         - Statement:
             - Effect: Allow
               Action:
@@ -196,75 +537,86 @@ Resources:
                 - logs:DescribeResourcePolicies
                 - logs:DescribeLogGroups
               Resource: '*'
-        - LambdaInvokePolicy:
-            FunctionName: !Ref dataExtractionFunction
-        - LambdaInvokePolicy:
-            FunctionName: !Ref dataTransformLoadFunction
-      Tracing:
-        Enabled: true
-      Type: STANDARD
-      DefinitionSubstitutions:
-        dataExtractionFunctionArn: !GetAtt dataExtractionFunction.Arn
-        dataTransformLoadFunctionArn: !GetAtt dataTransformLoadFunction.Arn
-  monthlyUserPermissionAssessmentLogGroup:
+        - AWSXrayWriteOnlyAccess
+      Tags:
+        Environment: !Ref Environment
+
+  StateMachineLogGroup:
     Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
-      LogGroupName: !Sub
-        - /aws/vendedlogs/states/${AWS::StackName}-${ResourceId}-Logs
-        - ResourceId: monthlyUserPermissionAssessment
+      LogGroupName: !Sub /aws/states/${AWS::StackName}-workflow
       RetentionInDays: 90
-  monthlyScheduleTomonthlyUserPermissionAssessmentRole:
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # EventBridge Schedule
+  MonthlySchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub ${AWS::StackName}-monthly
+      Description: Monthly IAM Identity Center analysis
+      ScheduleExpression: cron(0 8 1 * ? *)
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      ScheduleExpressionTimezone: UTC
+      Target:
+        Arn: !Ref AnalyzerStateMachine
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: !Sub |
+          {
+            "identityStoreId": "${IdentityStoreID}",
+            "instanceArn": "${IdentityStoreInstanceArn}",
+            "ssoDeployedRegion": "${AWS::Region}"
+          }
+
+  SchedulerRole:
     Type: AWS::IAM::Role
     Properties:
+      RoleName: !Sub ${AWS::StackName}-scheduler-role
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
-          Effect: Allow
-          Principal:
-            Service: !Sub scheduler.${AWS::URLSuffix}
-          Action: sts:AssumeRole
-          Condition:
-            ArnLike:
-              aws:SourceArn: 
-                - !GetAtt monthlyScheduleGroup.Arn
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
       Policies:
-        - PolicyName: StartExecutionPolicy
+        - PolicyName: StartStateMachine
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action: states:StartExecution
-                Resource: !Ref monthlyUserPermissionAssessment
-  monthlyReportBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketName: !Sub ${AWS::StackName}-monthlyre-${AWS::AccountId}
-      BucketEncryption:
-        ServerSideEncryptionConfiguration:
-          - ServerSideEncryptionByDefault:
-              SSEAlgorithm: aws:kms
-              KMSMasterKeyID: alias/aws/s3
-      PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        BlockPublicPolicy: true
-        IgnorePublicAcls: true
-        RestrictPublicBuckets: true
-      VersioningConfiguration:
-        Status: Enabled
-  monthlyReportBucketBucketPolicy:
-    Type: AWS::S3::BucketPolicy
-    Properties:
-      Bucket: !Ref monthlyReportBucket
-      PolicyDocument:
-        Id: RequireEncryptionInTransit
-        Version: '2012-10-17'
-        Statement:
-          - Principal: '*'
-            Action: '*'
-            Effect: Deny
-            Resource:
-              - !GetAtt monthlyReportBucket.Arn
-              - !Sub ${monthlyReportBucket.Arn}/*
-            Condition:
-              Bool:
-                aws:SecureTransport: 'false'
+                Resource: !Ref AnalyzerStateMachine
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  StateMachineArn:
+    Description: State Machine ARN
+    Value: !Ref AnalyzerStateMachine
+    Export:
+      Name: !Sub ${AWS::StackName}-StateMachineArn
+  ReportBucketName:
+    Description: S3 Bucket for reports
+    Value: !Ref ReportBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-ReportBucket
+  NotificationTopicArn:
+    Description: SNS Topic ARN
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub ${AWS::StackName}-TopicArn
+  KmsKeyArn:
+    Description: KMS Key ARN
+    Value: !GetAtt EncryptionKey.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-KmsKeyArn
