@@ -4,24 +4,22 @@ Automated monthly analysis of AWS IAM Identity Center users and their permission
 
 ## Architecture
 
-```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│   EventBridge   │────▶│  Step Functions  │────▶│     Lambda      │
-│   (Monthly)     │     │    Workflow      │     │   Extraction    │
-└─────────────────┘     └──────────────────┘     └────────┬────────┘
-                                                          │
-                        ┌──────────────────┐              ▼
-                        │     Lambda       │     ┌─────────────────┐
-                        │    Transform     │◀────│    DynamoDB     │
-                        └────────┬─────────┘     │  (Permissions   │
-                                 │               │   & Users)      │
-                    ┌────────────┼────────────┐  └─────────────────┘
-                    ▼            ▼            ▼
-             ┌──────────┐ ┌──────────┐ ┌──────────┐
-             │    S3    │ │   SNS    │ │   KMS    │
-             │ (Reports)│ │ (Notify) │ │(Encrypt) │
-             └──────────┘ └──────────┘ └──────────┘
-```
+![Architecture Diagram](docs/architecture.png)
+
+### Components
+
+| Component | Purpose |
+|-----------|---------|
+| EventBridge Scheduler | Monthly trigger |
+| Step Functions | Workflow orchestration with retry/catch |
+| Lambda (Extraction) | Extract users, groups, permission sets from Identity Center |
+| Lambda (Transform) | Generate CSV report, upload to S3, send notification |
+| DynamoDB | Store extracted data with TTL |
+| S3 | Store reports with lifecycle policy |
+| SNS | Email notifications |
+| KMS | Encrypt all data at rest |
+| SQS (DLQ) | Capture failed Lambda invocations |
+| CloudWatch | Logs and X-Ray tracing |
 
 ## Features
 
