@@ -2,7 +2,7 @@
 
 Automated monthly analysis of AWS IAM Identity Center users and their permission policies, generating comprehensive CSV reports.
 
-## 🏗️ Architecture
+## Architecture
 
 ```
 ┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
@@ -23,7 +23,7 @@ Automated monthly analysis of AWS IAM Identity Center users and their permission
              └──────────┘ └──────────┘ └──────────┘
 ```
 
-## ✨ Features
+## Features
 
 - **Automated Analysis**: Monthly scheduled analysis of all Identity Center users
 - **Comprehensive Reports**: CSV reports with users, groups, permission sets, and policies
@@ -31,13 +31,13 @@ Automated monthly analysis of AWS IAM Identity Center users and their permission
 - **Serverless**: Pay-per-use with no infrastructure to manage
 - **Observable**: X-Ray tracing, CloudWatch logs, SNS notifications
 
-## 📋 Prerequisites
+## Prerequisites
 
 - AWS Account with [IAM Identity Center](https://aws.amazon.com/iam/identity-center/) enabled
 - [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html) installed
 - Identity Store ID and Instance ARN ([how to find](https://docs.aws.amazon.com/singlesignon/latest/userguide/get-started-prereqs-considerations.html))
 
-## 🚀 Quick Start
+## Quick Start
 
 ### 1. Clone & Deploy
 
@@ -63,7 +63,7 @@ sam deploy --guided
 
 Check your email and confirm the SNS subscription to receive notifications.
 
-## 📊 Report Output
+## Report Output
 
 The generated CSV report includes:
 
@@ -81,7 +81,7 @@ The generated CSV report includes:
 | AWSManagedPolicy | AWS managed policy ARNs |
 | PermissionBoundary | Permission boundary details |
 
-## 🔧 Manual Execution
+## Manual Execution
 
 Trigger analysis manually via Step Functions console or CLI:
 
@@ -95,7 +95,7 @@ aws stepfunctions start-execution \
   }'
 ```
 
-## 🔒 Security Features
+## Security Features
 
 | Feature | Implementation |
 |---------|----------------|
@@ -106,7 +106,7 @@ aws stepfunctions start-execution \
 | Resilience | Dead Letter Queues, Step Functions retry/catch |
 | Observability | X-Ray tracing, CloudWatch Logs with retention |
 
-## 🧪 Testing
+## Testing
 
 ```bash
 # Create virtual environment
@@ -119,7 +119,7 @@ cd src/dataExtractionFunction && pytest test_extraction.py -v
 cd ../dataTransformLoadFunction && pytest test_transform.py -v
 ```
 
-## 🗑️ Cleanup
+## Cleanup
 
 ```bash
 # Empty S3 buckets first
@@ -130,7 +130,7 @@ aws s3 rm s3://<stack-name>-access-logs-<account-id> --recursive
 sam delete --stack-name <stack-name>
 ```
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 .
@@ -147,15 +147,15 @@ sam delete --stack-name <stack-name>
 └── README.md
 ```
 
-## 🤝 Contributing
+## Contributing
 
 Contributions welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) first.
 
-## 📄 License
+## License
 
 This project is licensed under the MIT-0 License - see [LICENSE](LICENSE) file.
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
 - Original project by [AWS Samples](https://github.com/aws-samples/aws-iam-identity-center-permission-policies-analyzer)
 - Built with [AWS SAM](https://aws.amazon.com/serverless/sam/)
