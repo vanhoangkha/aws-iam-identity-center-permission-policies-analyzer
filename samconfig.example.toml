@@ -1,0 +1,14 @@
+version = 0.1
+[default.deploy.parameters]
+stack_name = "iam-identity-analyzer"
+resolve_s3 = true
+s3_prefix = "iam-identity-analyzer"
+region = "us-east-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_NAMED_IAM"
+parameter_overrides = "Environment=\"prod\""
+tags = "Project=\"iam-identity-analyzer\" Environment=\"prod\""
+
+[default.build.parameters]
+parallel = true
+cached = true

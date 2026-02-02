@@ -10,15 +10,16 @@ __pycache__/
 .venv/
 venv/
 ENV/
+.pytest_cache/
 
 # IDE
 .idea/
 .vscode/
 *.swp
 *.swo
+.DS_Store
 
 # OS
-.DS_Store
 Thumbs.db
 
 # Logs
@@ -28,3 +29,8 @@ Thumbs.db
 samconfig.toml
 .env
 .env.local
+
+# Coverage
+htmlcov/
+.coverage
+coverage.xml
